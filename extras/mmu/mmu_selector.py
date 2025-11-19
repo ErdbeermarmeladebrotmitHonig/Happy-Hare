@@ -232,6 +232,12 @@ class LinearSelector(BaseSelector, object):
             self.cad_bypass_offset = 0     # Doesn't have bypass
             self.cad_last_gate_offset = 0. # Doesn't have reliable hard stop at limit of travel
 
+        elif self.mmu.mmu_machine.mmu_vendor.lower() == mmu_machine.VENDOR_PRUSA.lower():
+            self.cad_gate0_pos = 4.0
+            self.cad_gate_width = 20.
+            self.cad_bypass_offset = 0     # Doesn't have bypass
+            self.cad_last_gate_offset = 2. # Has hard stop at limit of travel
+
         # But still allow all CAD parameters to be customized
         self.cad_gate0_pos = mmu.config.getfloat('cad_gate0_pos', self.cad_gate0_pos, minval=0.)
         self.cad_gate_width = mmu.config.getfloat('cad_gate_width', self.cad_gate_width, above=0.)
@@ -243,7 +249,10 @@ class LinearSelector(BaseSelector, object):
         self.cad_selector_tolerance = mmu.config.getfloat('cad_selector_tolerance', self.cad_selector_tolerance, above=0.) # Extra movement allowed by selector
 
         # Sub components
-        self.servo = LinearSelectorServo(mmu)
+        if self.mmu.mmu_machine.mmu_vendor.lower() == mmu_machine.VENDOR_PRUSA.lower():
+            self.servo = LinearSelectorIdler(mmu)
+        else:
+            self.servo = LinearSelectorServo(mmu)
 
         # Register GCODE commands specific to this module
         gcode = mmu.printer.lookup_object('gcode')
@@ -656,7 +665,10 @@ class LinearSelector(BaseSelector, object):
 
     def _home_selector(self):
         self.mmu.unselect_gate()
-        self.servo.servo_move()
+        if hasattr(self.servo, 'home'):
+            self.servo.home()
+        else:
+            self.servo.servo_move()
         self.mmu.movequeues_wait()
         try:
             homing_state = mmu_machine.MmuHoming(self.mmu.printer, self.mmu_toolhead)
@@ -1051,7 +1063,298 @@ class LinearSelectorServo:
                      "Unknown",
         }
 
+class LinearSelectorIdler:
+    # mmu_vars.cfg variables
+    VARS_MMU_IDLER_OFFSETS = "mmu_idler_offsets"
 
+    def __init__(self, mmu):
+        self.mmu = mmu
+
+        # Idler states
+        self.IDLER_MOVE_STATE      = mmu.FILAMENT_HOLD_STATE
+        self.IDLER_DOWN_STATE      = mmu.FILAMENT_DRIVE_STATE
+        self.IDLER_UP_STATE        = mmu.FILAMENT_RELEASE_STATE
+        self.IDLER_UNKNOWN_STATE   = mmu.FILAMENT_UNKNOWN_STATE
+
+        # Process configs
+        self.idler_offsets = []
+        self.active_gate = -1
+        self.idler_dwell = mmu.config.getfloat('idler_dwell', 0.4, minval=0.1)
+        self.idler_buzz_gear_on_down = mmu.config.getint('idler_buzz_gear_on_down', 3, minval=0, maxval=10)
+        self._disengaged_gate = self.mmu.num_gates # Due to zero indexing this is 1 more than the gate indexes
+
+        # Gate-specific offsets
+        self.is_homed = False
+
+        self.idler_state = self.IDLER_UNKNOWN_STATE
+
+        self.mmu_toolhead = None
+        self.idler_rail = None
+        self.ider_stepper = None
+
+        # Get the idler stepper
+        # self.idler = mmu.printer.lookup_object('mmu_idler', None)
+        # if not self.idler:
+        #     raise mmu.config.error("No [mmu_idler] definition found in mmu_hardware.cfg")
+
+        # Register GCODE commands specific to this module
+        gcode = self.mmu.printer.lookup_object('gcode')
+        gcode.register_command('MMU_IDLER', self.cmd_MMU_IDLER, desc=self.cmd_MMU_IDLER_help)
+        gcode.register_command('MMU_CALIBRATE_IDLER', self.cmd_MMU_CALIBRATE_IDLER, desc=self.cmd_MMU_CALIBRATE_IDLER_help)
+
+        self.reinit()
+
+    def reinit(self):
+        self.idler_state = self.IDLER_UNKNOWN_STATE
+        self.idler_position = self.IDLER_UNKNOWN_STATE
+        self.active_gate = -1
+
+    def handle_connect(self):
+        self.mmu_toolhead = self.mmu.mmu_toolhead
+        self.idler_rail = self.mmu_toolhead.get_kinematics().rails[2]
+        self.idler_stepper = self.idler_rail.steppers[0]
+
+        # Load idler offsets (calibration set with MMU_CALIBRATE_IDLER)
+        self.idler_offsets = self.mmu.save_variables.allVariables.get(self.VARS_MMU_IDLER_OFFSETS, None)
+        if self.idler_offsets:
+            # Ensure list size
+            if len(self.idler_offsets) == self.mmu.num_gates + 1:
+                self.mmu.log_debug("Loaded saved idler offsets: %s" % self.idler_offsets)
+            else:
+                self.mmu.log_error("Incorrect number of gates specified in %s. Adjusted length" % self.VARS_MMU_IDLER_OFFSETS)
+                self.idler_offsets = self._ensure_list_size(self.idler_offsets, self.mmu.num_gates + 1)
+
+            if not any(x == -1 for x in self.idler_offsets):
+                self.mmu.calibration_status |= self.mmu.CALIBRATED_SELECTOR
+        else:
+            self.mmu.log_always("Warning: Idler offsets not found in mmu_vars.cfg. Probably not calibrated")
+            self._ensure_list_size(self.idler_offsets, self.mmu.num_gates + 1)
+        self.mmu.save_variables.allVariables[self.VARS_MMU_IDLER_OFFSETS] = self.idler_offsets
+
+    def handle_disconnect(self):
+        pass
+
+    def handle_ready(self):
+        pass
+
+    def _ensure_list_size(self, lst, size, default_value=-1):
+        lst = lst[:size]
+        lst.extend([default_value] * (size - len(lst)))
+        return lst
+
+    cmd_MMU_IDLER_help = "Move MMU idler to specified position"
+    def cmd_MMU_IDLER(self, gcmd):
+        self.mmu.log_to_file(gcmd.get_commandline())
+        if self.mmu.check_if_disabled(): return
+        home = gcmd.get_int('HOME', None)
+        reset = gcmd.get_int('RESET', 0)
+        save = gcmd.get_int('SAVE', 0)
+        gate = gcmd.get_int('GATE', None)
+        if home:
+            self.mmu.log_debug("Homing idler")
+            self.home()
+            return
+        if reset:
+            self.mmu.delete_variable(self.VARS_MMU_IDLER_OFFSETS, write=True)
+            self.mmu.log_info("Calibrated idler positions have been reset to configured defaults")
+        elif save:
+            position = gcmd.get_int('POSITION', None)
+            if not position:
+                self.mmu.log_error("Position not specified for save command")
+                return
+            if not gate:
+                self.mmu.log_error("Gate must be specified for save command")
+            self.idler_offsets[gate] = position
+            self.mmu.save_variables.allVariables[self.VARS_MMU_IDLER_OFFSETS] = self.idler_offsets
+        else:
+            position = gcmd.get_int('POSITION', None)
+            if position is not None:
+                cur_pos = self.mmu_toolhead.get_position()
+                cur_pos[2] = position
+                self.mmu.log_debug("Setting idler to position: %s" % cur_pos)
+                speed, accel = self.mmu_toolhead.get_idler_limits()
+                with self.mmu.wrap_accel(accel):
+                    self.mmu_toolhead.move(cur_pos, speed)
+            elif gate is not None:
+                self._set_idler_to_gate(gate)
+            else:
+                self.mmu.log_always("Current idler position: %s" % (self.mmu_toolhead.get_position()))
+                self.mmu.log_info("Use POS= or POSITION= to move position")
+
+    def _set_idler_to_gate(self, gate):
+        if not self.is_homed:
+            return
+        if gate >= len(self.idler_offsets):
+            self.mmu.log_error("Gate number does not exist")
+            return
+        if len(self.idler_offsets) != self.mmu.num_gates + 1:
+            self.mmu.log_info("Ignoring setting idler to gate %d, not initialised", gate)
+            return
+
+        self.mmu.log_info('Setting idler to gate %d, number of offsets %d ' % (gate, len(self.idler_offsets)))
+        target_idler_pos = self.idler_offsets[gate]
+
+
+        cur_pos = self.mmu_toolhead.get_position()
+        cur_pos[2] = target_idler_pos
+
+        speed, accel = self.mmu_toolhead.get_idler_limits()
+        with self.mmu.wrap_accel(accel):
+            self.mmu_toolhead.move(cur_pos, speed)
+
+        if self.mmu.log_enabled(self.mmu.LOG_STEPPER):
+            self.mmu.log_stepper("IDLER MOVE: position=%.1f, speed=%.1f, accel=%.1f" % (target_idler_pos, speed, accel))
+        self.mmu.movequeues_wait(toolhead=False, mmu_toolhead=True)
+
+        self.active_gate = gate
+        if gate != self._disengaged_gate:
+            self.idler_state = self.IDLER_DOWN_STATE
+        else:
+            self.idler_state = self.IDLER_UP_STATE
+
+    def servo_down(self, buzz_gear=False):
+        if self.mmu._is_running_test: return # Save idler while testing
+        if self.mmu.gate_selected == self.mmu.TOOL_GATE_BYPASS: return
+        if self.active_gate == self.mmu.gate_selected: return
+
+        self._set_idler_to_gate(self.mmu.gate_selected)
+
+        if self.active_gate != self._disengaged_gate:
+            self.mmu.mmu_macro_event(self.mmu.MACRO_EVENT_FILAMENT_GRIPPED)
+
+    def servo_move(self): # Position idler for selector movement
+        self._set_idler_to_gate(self._disengaged_gate)
+        self.idler_state = self.IDLER_MOVE_STATE
+
+    def servo_up(self, measure=False):
+        if self.mmu._is_running_test: return 0. # Save idler while testing
+        if self.idler_state == self.IDLER_UP_STATE: return 0.
+
+        self._set_idler_to_gate(self._disengaged_gate)
+
+    def _servo_auto(self):
+        if self.mmu.is_printing() and self.mmu_toolhead.is_gear_synced_to_extruder():
+            self.servo_down()
+        elif not self.mmu.selector.is_homed or self.mmu.tool_selected < 0 or self.mmu.gate_selected < 0:
+            self.servo_move()
+        else:
+            self.servo_up()
+
+    # De-energize idler
+    def servo_off(self):
+        pass  # Idler should hold its position
+
+    def get_filament_grip_state(self):
+        return self.idler_state
+
+    def disable_motors(self):
+        stepper_enable = self.mmu.printer.lookup_object('stepper_enable')
+        se = stepper_enable.lookup_enable(self.idler_stepper.get_name())
+        se.motor_disable(self.mmu_toolhead.get_last_move_time())
+        self.is_homed = False
+        self.reinit() # Reset state
+
+    def enable_motors(self):
+        stepper_enable = self.mmu.printer.lookup_object('stepper_enable')
+        se = stepper_enable.lookup_enable(self.idler_stepper.get_name())
+        se.motor_enable(self.mmu_toolhead.get_last_move_time())
+
+    def buzz_motor(self):
+        self.mmu.movequeues_wait()
+        old_state = self.idler_state
+        low = min(self.idler_positions['down'], self.idler_positions['up'])
+        high = max(self.idler_positions['down'], self.idler_positions['up'])
+        mid = (low + high) // 2
+        move = (high - low) // 4
+        self.idler.do_move(mid)
+        self.mmu.movequeues_dwell(0.5, mmu_toolhead=False)
+        self.idler.do_move(mid - move)
+        self.mmu.movequeues_dwell(0.5, mmu_toolhead=False)
+        self.idler.do_move(mid + move)
+        self.mmu.movequeues_dwell(0.5, mmu_toolhead=False)
+        self.mmu.movequeues_wait()
+        if old_state == self.IDLER_DOWN_STATE:
+            self.servo_down(buzz_gear=False)
+        elif old_state == self.IDLER_MOVE_STATE:
+            self.servo_move()
+        else:
+            self.servo_up()
+
+    def get_mmu_status_config(self):
+        msg = ". Idler in %s position" % ("UP" if self.idler_state == self.IDLER_UP_STATE else \
+                "DOWN" if self.idler_state == self.IDLER_DOWN_STATE else "MOVE" if self.idler_state == self.IDLER_MOVE_STATE else "unknown")
+        return msg
+
+    def get_status(self):
+        return {
+            'servo': "Up" if self.idler_state == self.IDLER_UP_STATE else
+                     "Down" if self.idler_state == self.IDLER_DOWN_STATE else
+                     "Move" if self.idler_state == self.IDLER_MOVE_STATE else
+                     "Unknown",
+        }
+
+    def home(self):
+        if self.mmu.check_if_bypass(): return
+        with self.mmu.wrap_action(self.mmu.ACTION_HOMING):
+            self.mmu.log_info("Homing MMU Idler...")
+            # self.mmu.unselect_gate() # Gate must be re-selected for the idler to return to the correct position
+            self.mmu.movequeues_wait()
+            try:
+                homing_state = mmu_machine.MmuHoming(self.mmu.printer, self.mmu_toolhead)
+                homing_state.set_axes([2])
+                self.mmu.mmu_toolhead.get_kinematics().home(homing_state)
+                self.is_homed = True
+                self.mmu.log_info("Homed MMU Idler...")
+            except Exception as e:  # Homing failed
+                raise MmuError(
+                    "Homing idler failed. Klipper reports: %s" % str(e))
+
+    def get_uncalibrated_gates(self, check_gates):
+        """Return a list of gates that are not calibrated"""
+        return [gate for gate, value in enumerate(self.idler_offsets) if value == -1 and gate in check_gates]
+
+    cmd_MMU_CALIBRATE_IDLER_help = "Calibration of the idler positions for specified gate"
+    def cmd_MMU_CALIBRATE_IDLER(self, gcmd):
+        self.mmu.log_to_file(gcmd.get_commandline())
+        if self.mmu.check_if_disabled(): return
+
+        save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
+        gate = gcmd.get_int('GATE', -1, minval=0, maxval=self.mmu.mmu_machine.num_gates - 1)
+        position = gcmd.get_int('POSITION', None)
+
+        try:
+            self.mmu.calibrating = True
+
+            if gate >= len(self.idler_offsets):
+                self.mmu.log_error("Gate number does not exist")
+            if gate >= 0 and position is not None:
+                # Calibrate a specific gate with the provided position
+                self.mmu.log_always("Calibrating idler position for gate %d to %d" % (gate, position))
+                self.idler_offsets[gate] = position
+
+                if save:
+                    self.mmu.save_variable(self.VARS_MMU_IDLER_OFFSETS, self.idler_offsets, write=True)
+                    self.mmu.log_always("Idler position for gate %d saved: %d" % (gate, position))
+
+                    # If all gates are calibrated, update calibration status
+                    if not any(x == -1 for x in self.idler_offsets):
+                        self.mmu.calibration_status |= self.mmu.CALIBRATED_SELECTOR
+                        self.mmu.log_always("Idler calibration complete")
+            elif gate == -1 and position is None:
+                # Display current calibration status
+                self.mmu.log_always("Current idler offsets: %s" % self.idler_offsets)
+                uncalibrated = self.get_uncalibrated_gates(range(self.mmu.num_gates))
+                if uncalibrated:
+                    self.mmu.log_always("Uncalibrated gates: %s" % uncalibrated)
+                else:
+                    self.mmu.log_always("All gates are calibrated")
+            else:
+                self.mmu.log_error("Invalid parameters. Use GATE= and POSITION= to calibrate a specific gate")
+
+        except Exception as e:
+            self.mmu.log_error("Error during idler calibration: %s" % str(e))
+        finally:
+            self.mmu.calibrating = False
 
 ################################################################################
 # Rotary Selector
