@@ -1077,7 +1077,7 @@ class LinearSelectorIdler:
         self.IDLER_UNKNOWN_STATE   = mmu.FILAMENT_UNKNOWN_STATE
 
         # Process configs
-        self.idler_offsets = []
+        self.idler_offsets = [218, 178, 138, 98, 58]  # from Prusa-Firmware-MMU firmware code
         self.active_gate = -1
         self.idler_dwell = mmu.config.getfloat('idler_dwell', 0.4, minval=0.1)
         self.idler_buzz_gear_on_down = mmu.config.getint('idler_buzz_gear_on_down', 3, minval=0, maxval=10)

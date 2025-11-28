@@ -158,13 +158,13 @@ self_update() {
 
     set +e
     git diff --quiet --exit-code "origin/$BRANCH"
-    if [ $? -eq 1 ]; then
-        echo -e "${B_GREEN}Found a new version of Happy Hare on github, updating..."
-        [ -n "$(git status --porcelain)" ] && {
-            git stash push -m 'local changes stashed before self update' --quiet
-        }
-        RESTART=1
-    fi
+    # if [ $? -eq 1 ]; then
+    #     echo -e "${B_GREEN}Found a new version of Happy Hare on github, updating..."
+    #     [ -n "$(git status --porcelain)" ] && {
+    #         git stash push -m 'local changes stashed before self update' --quiet
+    #     }
+    #     RESTART=1
+    # fi
     set -e
 
     if [ -n "${N_BRANCH}" -a "${BRANCH}" != "${N_BRANCH}" ]; then
@@ -1575,6 +1575,7 @@ questionaire() {
     option MMX            'MMX'
     option VVD            'BigTreeTech ViViD (BETA)'
     option KMS            'KMS'
+    option PRUSA_MMU      'Prusa MMU'
     option OTHER          'Other / Custom (or just want starter config files)'
     prompt_option opt 'MMU Type' "${OPTIONS[@]}"
     case $opt in
@@ -2081,6 +2082,33 @@ questionaire() {
             _param_sync_feedback_buffer_maxrange=12
             ;;
 
+        "$PRUSA_MMU")
+            HAS_ENCODER=no
+            HAS_SELECTOR=yes
+            HAS_SERVO=no
+
+            _hw_num_gates=5
+            _hw_mmu_vendor="Prusa"
+            _hw_mmu_version="3"
+            _hw_selector_type=LinearSelectorIdler
+            _hw_variable_bowden_lengths=0
+            _hw_variable_rotation_distances=0
+            _hw_require_bowden_move=1
+            _hw_filament_always_gripped=0
+            _hw_gear_gear_ratio="1:1"
+            _hw_gear_run_current=0.5
+            _hw_gear_hold_current=0.1
+            _hw_sel_gear_ratio="1:1"
+            _hw_sel_run_current=0.4
+            _hw_sel_hold_current=0.2
+            _param_enable_clog_detection=0
+            _param_extruder_homing_endstop="none"
+            _param_gate_homing_endstop="mmu_gate"
+            _param_gate_parking_distance=50 # todo: verify
+
+            ;;
+
+
         *)
             HAS_ENCODER=yes
             HAS_SELECTOR=yes
@@ -2200,7 +2228,7 @@ questionaire() {
             ;;
         esac
 
-    if [ "${_hw_mmu_vendor}" != "KMS" -a "${_hw_mmu_vendor}" != "VVD" ]; then
+    if [ "${_hw_mmu_vendor}" != "KMS" -a "${_hw_mmu_vendor}" != "VVD" -a  "${_hw_mmu_vendor}" != "Prusa" ]; then
         echo -e "${PROMPT}${SECTION}How many gates (lanes) do you have?${INPUT}"
         _hw_num_gates=$(prompt_123 "Number of gates")
     fi
@@ -2291,6 +2319,7 @@ questionaire() {
         option WGB_3                'WGB v3.0'
         option SKR_PICO_1           'BTT SKR Pico v1.0'
         option EBB42_12             'BTT EBB 42 CANbus v1.2 (for MMX or Pico)'
+        option PRUSA_MM_CONTROL     'Prusa MM Control Board (for Prusa MMU2S/3)'
         option OTHER                'Not in list / Unknown'
         prompt_option opt 'MCU Type' "${OPTIONS[@]}"
         case $opt in
@@ -2349,6 +2378,10 @@ questionaire() {
             "$EBB42_12")
                 _hw_brd_type="EBB42_12"
                 pattern="Klipper_"
+                ;;
+            "$PRUSA_MM_CONTROL")
+                _hw_brd_type="PRUSA_MM_CONTROL"
+                pattern="Klipper_atmega32u4"
                 ;;
             *)
                 _hw_brd_type="unknown"
